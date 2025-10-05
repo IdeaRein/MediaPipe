@@ -34,4 +34,6 @@ def analyze_golf_swing(video_file, output_prefix="outputs/swing_result"):
 if __name__ == "__main__":
     folder = "C:/Users/kohei.kuwahara/Desktop/Training/MediaPipe/images/"
     video_file = os.path.join(folder, "sample_user.mp4")
+    #video_file = os.path.join(folder, "sample_matuyamaHideki.mp4")
+    #video_file = os.path.join(folder, "sample_TigerWoods.mp4")
     analyze_golf_swing(video_file, output_prefix="outputs/sample2_analysis")
