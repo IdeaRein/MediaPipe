@@ -1,4 +1,6 @@
 import numpy as np
+import cv2
+import os
 from utils import line_angle, angle_3pt, smooth_series
 
 
@@ -20,27 +22,48 @@ def normalize_landmarks(landmarks: np.ndarray) -> np.ndarray:
 
 
 # =========================================================
-# 🧩 改良版キーイベント検出
+# 🏌️ 追加: ボール消失検出 (OpenCV)
 # =========================================================
-def _x_factor_series(landmarks: np.ndarray):
-    """各フレームの肩角度・腰角度・Xファクター(肩-腰)を返す"""
-    T = landmarks.shape[0]
-    sh, hp, xf = [], [], []
-    for t in range(T):
-        L = landmarks[t]
-        shoulder_angle = line_angle(L[11][:2], L[12][:2])
-        hip_angle = line_angle(L[23][:2], L[24][:2])
-        sh.append(shoulder_angle)
-        hp.append(hip_angle)
-        xf.append(shoulder_angle - hip_angle)
-    return np.asarray(sh), np.asarray(hp), np.asarray(xf)
-
-
-def detect_keyframes(landmarks: np.ndarray, fps: int = 30) -> dict:
+def detect_ball_disappearance(video_path: str) -> int | None:
     """
-    改良版（後方撮影カメラ向け）:
-      - トップ: 手が最も高く（y最小）かつ後方(z最大)の位置
-      - インパクト: 手速度が急上昇し終える直前（加速度反転点）
+    OpenCVでボールが最後に見えるフレームを検出。
+    明るい円形領域（白いボール）が見つかった最後のフレーム番号を返す。
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"⚠️ 動画が開けません: {video_path}")
+        return None
+
+    frame_idx = 0
+    last_visible = None
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        # ボール（明るく小さな円）を検出
+        circles = cv2.HoughCircles(
+            gray, cv2.HOUGH_GRADIENT, dp=1.2, minDist=30,
+            param1=80, param2=18, minRadius=2, maxRadius=8
+        )
+        if circles is not None:
+            last_visible = frame_idx
+        frame_idx += 1
+
+    cap.release()
+    return last_visible
+
+
+# =========================================================
+# 🧩 改良版キーイベント検出（ボール補正対応）
+# =========================================================
+def detect_keyframes(landmarks: np.ndarray, fps: int = 30, video_path: str = None, output_dir: str = "outputs") -> dict:
+    """
+    改良版（トップ検出タイミング補正＋画像保存つき）:
+      - トップ: 手の高さ(y)が上昇→下降に転じる“最高点”の直前
+      - インパクト: 手速度が最大になる瞬間
+      - 検出直後に対象フレーム画像を保存（video_path必須）
     """
     T = landmarks.shape[0]
     if T < 5:
@@ -48,36 +71,59 @@ def detect_keyframes(landmarks: np.ndarray, fps: int = 30) -> dict:
 
     left_wr, right_wr = landmarks[:, 15, :3], landmarks[:, 16, :3]
     pos = (left_wr + right_wr) / 2.0  # 両手の中点
-    y, z = pos[:, 1], pos[:, 2]
+    y = pos[:, 1]
+    z = pos[:, 2]
 
-    # ✅ トップ：前半区間で手が最も高く（yが最小）かつ後方(zが最大)
-    half = max(1, T // 2)
-    score_top = -y[:half] + z[:half] * 0.5  # y小さいほど上、z大きいほど後ろ
-    top_idx = int(np.argmax(score_top))
+    # 🎯 1. 手の高さ変化（Y軸の速度）で上昇→下降の転換点を探す
+    dy = np.gradient(y)
+    dy_s = np.convolve(dy, np.ones(5)/5, mode='same')  # 平滑化
+    top_candidates = np.where((dy_s[:-1] > 0) & (dy_s[1:] <= 0))[0]  # 上昇→下降の変化点
 
-    # ✅ インパクト：手の速度から加速度反転点を検出
+    if len(top_candidates) > 0:
+        score = -y[top_candidates] + 0.3 * z[top_candidates]
+        top_idx = int(top_candidates[np.argmax(score)])
+    else:
+        top_idx = int(np.argmin(y))
+
+    # 🎯 2. インパクト検出：手の移動速度が最大になる瞬間
     vel = np.linalg.norm(np.diff(pos[:, :2], axis=0), axis=1) * fps
-    vel_s = smooth_series(vel, window=5)
-    acc = np.diff(vel_s)
-    acc_s = smooth_series(acc, window=3)
+    vel_s = np.convolve(vel, np.ones(5)/5, mode='same')
+    impact_idx = int(np.argmax(vel_s))
 
-    peak = int(np.argmax(vel_s))
-    impact_idx = peak
-    for i in range(max(1, peak - 8), peak + 1):
-        if acc_s[i - 1] > 0 and acc_s[i] <= 0:
-            impact_idx = i
-            break
+    # 🎯 3. インパクト補正
+    impact_idx = max(top_idx + 1, impact_idx)
+    impact_idx = min(impact_idx, T - 2)
 
-    impact_idx = int(np.clip(impact_idx, top_idx + 1, T - 2))
+    # =========================================================
+    # 🖼️ 4. 検出したフレームを画像として保存（video_pathがある場合のみ）
+    # =========================================================
+    if video_path is not None and os.path.exists(video_path):
+        os.makedirs(output_dir, exist_ok=True)
+        cap = cv2.VideoCapture(video_path)
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if top_idx < total_frames and impact_idx < total_frames:
+            frame_indices = [top_idx, impact_idx]
+            names = ["top_detect_frame.jpg", "impact_detect_frame.jpg"]
+            for idx, name in zip(frame_indices, names):
+                cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                ret, frame = cap.read()
+                if ret:
+                    save_path = os.path.join(output_dir, name)
+                    cv2.imwrite(save_path, frame)
+                    print(f"🖼️ 保存完了: {name}（フレーム {idx}）")
+        cap.release()
+    else:
+        print("⚠️ video_pathが指定されていないため、画像保存をスキップしました。")
+
     return {"top": top_idx, "impact": impact_idx}
-
 
 # =========================================================
 # 🧩 特徴量抽出
 # =========================================================
-def extract_summary_features(landmarks: np.ndarray, fps: int = 30) -> dict:
+def extract_summary_features(landmarks: np.ndarray, fps: int = 30, video_path: str = None, output_dir: str = "outputs") -> dict:
     T = landmarks.shape[0]
-    kf = detect_keyframes(landmarks, fps)
+    kf = detect_keyframes(landmarks, fps, video_path, output_dir)
     top, impact = kf["top"], kf["impact"]
 
     # ✅ 追加：フレーム番号を出力
